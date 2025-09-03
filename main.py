@@ -1,195 +1,150 @@
-"""Simple real-time face detection using OpenCV Haar Cascade.
+"""Entry point for modular face detection (Haar / DNN)."""
 
-Perbaikan utama dibanding versi awal:
-  - Menggunakan grayscale untuk deteksi (lebih akurat & ringan).
-  - Validasi pemuatan model cascade dan kamera.
-  - Struktur fungsi lebih modular.
-  - Cleanup terjamin dengan try/finally.
-  - Path model robust relatif terhadap lokasi file ini.
-Tekan 'q' untuk keluar.
-"""
-
-from pathlib import Path
 import sys
-import cv2
+import time
 import argparse
-from collections import deque
-
-# ---------------- Configuration ---------------- #
-CASCADE_FILENAME = "face_ref.xml"  # Haar utama (frontal face)
-WINDOW_NAME = "FaceDetection"
-
-# Default tuning (bisa dioverride via argumen CLI)
-DEFAULT_SCALE = 1.1
-DEFAULT_MIN_NEIGHBORS = 6  # sedikit dinaikkan untuk kurangi false positive
-DEFAULT_MIN_SIZE_RATIO = 0.08  # min tinggi wajah relatif terhadap tinggi frame
-DEFAULT_ASPECT_MIN = 0.75
-DEFAULT_ASPECT_MAX = 1.35
-STABILITY_WINDOW = 5  # jumlah frame untuk stabilisasi (temporal smoothing)
-
-# Optional eye cascade (second-stage validation) - gunakan yang bawaan OpenCV jika tersedia
-EYE_CASCADE_PATH = Path(cv2.data.haarcascades) / "haarcascade_eye.xml"
-
-
-def load_cascade() -> cv2.CascadeClassifier:
-  """Load Haar Cascade file and validate.
-  Exit program if file not found / invalid.
-  """
-  cascade_path = Path(__file__).parent / CASCADE_FILENAME
-  if not cascade_path.exists():
-    print(f"[ERROR] File model tidak ditemukan: {cascade_path}", file=sys.stderr)
-    sys.exit(1)
-  cascade = cv2.CascadeClassifier(str(cascade_path))
-  if cascade.empty():
-    print("[ERROR] Gagal memuat Haar Cascade (file korup / format salah)", file=sys.stderr)
-    sys.exit(1)
-  return cascade
-
-
-def detect_faces(gray_frame, cascade: cv2.CascadeClassifier, *, scale, min_neighbors, min_size):
-  """Return list of face bounding boxes (x,y,w,h) dengan parameter dinamis."""
-  return cascade.detectMultiScale(
-    gray_frame,
-    scaleFactor=scale,
-    minNeighbors=min_neighbors,
-    flags=cv2.CASCADE_SCALE_IMAGE,
-    minSize=min_size,
-  )
-
-
-def draw_face_boxes(frame, faces):
-  for (x, y, w, h) in faces:
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-
-def load_eye_cascade():
-  if EYE_CASCADE_PATH.exists():
-    eye = cv2.CascadeClassifier(str(EYE_CASCADE_PATH))
-    if not eye.empty():
-      return eye
-  return None
-
-
-def filter_candidates(candidates, frame_shape, *, aspect_min, aspect_max):
-  """Filter berdasar rasio aspek agar objek non-wajah (terlalu lebar/tinggi) tereliminasi."""
-  filtered = []
-  for (x, y, w, h) in candidates:
-    aspect = w / float(h)
-    if aspect < aspect_min or aspect > aspect_max:
-      continue
-    # (Opsional tambahan bisa: posisi, area relative, dsb)
-    filtered.append((x, y, w, h))
-  return filtered
-
-
-def eye_stage_validation(gray_frame, faces, eye_cascade, max_checks=6):
-  """Validasi tambahan: pastikan ada minimal 1 pasang (atau 1) mata dalam region wajah.
-  Membatasi jumlah region yang dicek untuk efisiensi.
-  """
-  if eye_cascade is None:
-    return faces
-  validated = []
-  for idx, (x, y, w, h) in enumerate(faces):
-    if idx >= max_checks:
-      # Jangan cek semuanya agar tetap realtime
-      validated.append((x, y, w, h))
-      continue
-    roi_gray = gray_frame[y:y+h, x:x+w]
-    eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, flags=cv2.CASCADE_SCALE_IMAGE, minSize=(int(w*0.15), int(h*0.15)))
-    if len(eyes) >= 1:  # minimal terdeteksi 1 mata
-      validated.append((x, y, w, h))
-  return validated
-
-
-def stabilize_detections(history_deque, current_faces):
-  """Sederhana: hanya gunakan face yang konsisten muncul beberapa frame.
-  Menghitung frekuensi kasar bounding box (aproksimasi posisi) dalam window.
-  """
-  history_deque.append(current_faces)
-  # Flatten
-  all_faces = [f for frame_faces in history_deque for f in frame_faces]
-  stabilized = []
-  for (x, y, w, h) in current_faces:
-    # Hitung berapa kali kemunculan (dengan toleransi posisi)
-    count = 0
-    for (x2, y2, w2, h2) in all_faces:
-      if abs(x - x2) < w * 0.25 and abs(y - y2) < h * 0.25:
-        count += 1
-    if count >= max(2, len(history_deque)//2):  # ambang dinamis
-      stabilized.append((x, y, w, h))
-  return stabilized
-
-
-def open_camera(device_index: int = 0) -> cv2.VideoCapture:
-  cap = cv2.VideoCapture(device_index)
-  if not cap.isOpened():
-    print(f"[ERROR] Kamera dengan index {device_index} tidak dapat dibuka", file=sys.stderr)
-    sys.exit(1)
-  return cap
+import cv2
+from fd.config import (
+  WINDOW_NAME,
+  DEFAULT_METHOD,
+  DEFAULT_SCALE,
+  DEFAULT_MIN_NEIGHBORS,
+  DEFAULT_MIN_SIZE_RATIO,
+  DEFAULT_ASPECT_MIN,
+  DEFAULT_ASPECT_MAX,
+  STABILITY_WINDOW,
+  DEFAULT_DETECT_WIDTH,
+  DEFAULT_DNN_MODEL,
+  DEFAULT_DNN_PROTOTXT,
+  DEFAULT_DNN_THRESHOLD,
+)
+from fd.detectors.haar import HaarDetector
+from fd.detectors.dnn import DNNDetector
+from fd.detectors.base import DetectParams
+from fd.postprocess import Stabilizer
+from fd.video.frame_grabber import FrameGrabber
 
 
 def parse_args():
-  p = argparse.ArgumentParser(description="Realtime Face Detection (Haar) dengan filter false positive")
-  p.add_argument("--camera", type=int, default=0, help="Index kamera (default 0)")
-  p.add_argument("--scale", type=float, default=DEFAULT_SCALE, help="scaleFactor untuk Haar (rendah=lebih akurat tapi lambat)")
-  p.add_argument("--neighbors", type=int, default=DEFAULT_MIN_NEIGHBORS, help="minNeighbors (lebih tinggi=lebih sedikit false positive)")
-  p.add_argument("--min-size-ratio", type=float, default=DEFAULT_MIN_SIZE_RATIO, help="Rasio minimum tinggi wajah terhadap tinggi frame (0-1)")
-  p.add_argument("--aspect-min", type=float, default=DEFAULT_ASPECT_MIN, help="Rasio aspek minimum (w/h)")
-  p.add_argument("--aspect-max", type=float, default=DEFAULT_ASPECT_MAX, help="Rasio aspek maksimum (w/h)")
-  p.add_argument("--no-eye-check", action="store_true", help="Matikan validasi mata (lebih cepat, mungkin lebih banyak false positive)")
-  p.add_argument("--no-stabilize", action="store_true", help="Matikan stabilisasi temporal")
+  p = argparse.ArgumentParser(description="Realtime Face Detection (Haar / DNN) modular")
+  p.add_argument("--camera", type=int, default=0, help="Index kamera")
+  p.add_argument("--method", choices=["haar", "dnn"], default=DEFAULT_METHOD, help="Metode deteksi")
+  p.add_argument("--scale", type=float, default=DEFAULT_SCALE, help="Haar scaleFactor")
+  p.add_argument("--neighbors", type=int, default=DEFAULT_MIN_NEIGHBORS, help="Haar minNeighbors")
+  p.add_argument("--min-size-ratio", type=float, default=DEFAULT_MIN_SIZE_RATIO, help="Rasio tinggi wajah minimum (0-1)")
+  p.add_argument("--aspect-min", type=float, default=DEFAULT_ASPECT_MIN, help="Rasio aspek minimum")
+  p.add_argument("--aspect-max", type=float, default=DEFAULT_ASPECT_MAX, help="Rasio aspek maksimum")
+  p.add_argument("--detect-width", type=int, default=DEFAULT_DETECT_WIDTH, help="Lebar resize deteksi (0=off)")
+  p.add_argument("--no-thread", action="store_true", help="Matikan threaded capture")
+  p.add_argument("--no-stabilize", action="store_true", help="Matikan stabilisasi bounding box")
+  p.add_argument("--no-eye-check", action="store_true", help="Matikan validasi mata (Haar)")
+  p.add_argument("--dnn-prototxt", default=DEFAULT_DNN_PROTOTXT, help="Path prototxt DNN")
+  p.add_argument("--dnn-model", default=DEFAULT_DNN_MODEL, help="Path caffemodel DNN")
+  p.add_argument("--dnn-threshold", type=float, default=DEFAULT_DNN_THRESHOLD, help="Ambang DNN (0-1)")
   return p.parse_args()
 
 
-def main(device_index: int = 0):  # device_index dipakai bila langsung dipanggil tanpa CLI
-  args = parse_args() if len(sys.argv) > 1 else argparse.Namespace(
-    camera=device_index,
-    scale=DEFAULT_SCALE,
-    neighbors=DEFAULT_MIN_NEIGHBORS,
-    min_size_ratio=DEFAULT_MIN_SIZE_RATIO,
-    aspect_min=DEFAULT_ASPECT_MIN,
-    aspect_max=DEFAULT_ASPECT_MAX,
-    no_eye_check=False,
-    no_stabilize=False,
-  )
+def build_detector(args):
+  if args.method == "haar":
+    return HaarDetector(args.scale, args.neighbors, not args.no_eye_check)
+  return DNNDetector(args.dnn_prototxt, args.dnn_model, args.dnn_threshold)
 
-  cascade = load_cascade()
-  eye_cascade = None if args.no_eye_check else load_eye_cascade()
-  cap = open_camera(args.camera)
-  history = deque(maxlen=STABILITY_WINDOW)
+
+def draw_overlay(frame, boxes, method_label: str, raw_count: int, fps: float, target_w, threaded: bool):
+  for (x, y, w, h) in boxes:
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+  cv2.putText(frame, f"Faces: {len(boxes)} (raw:{raw_count})", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+  cv2.putText(frame, method_label, (10, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 255, 200), 1, cv2.LINE_AA)
+  cv2.putText(frame, f"detW={target_w or frame.shape[1]} thr={'on' if threaded else 'off'}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 220, 255), 1, cv2.LINE_AA)
+  cv2.putText(frame, f"FPS~{fps:.1f}", (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 0), 2, cv2.LINE_AA)
+
+
+def main():
+  args = parse_args()
+  try:
+    detector = build_detector(args)
+  except Exception as e:  # noqa: BLE001
+    print(f"[ERROR] {e}", file=sys.stderr)
+    sys.exit(1)
+
+  stabilizer = Stabilizer(STABILITY_WINDOW) if not args.no_stabilize else None
+
+  # Capture setup
+  if args.no_thread:
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+      print("[ERROR] Tidak bisa membuka kamera", file=sys.stderr)
+      sys.exit(1)
+    grabber = None
+  else:
+    grabber = FrameGrabber(args.camera, args.detect_width).start()
+    cap = None
+
+  fps_time = time.time()
+  fps = 0.0
 
   try:
     while True:
-      ret, frame = cap.read()
-      if not ret:
-        print("[WARN] Gagal membaca frame dari kamera. Mengakhiri.")
-        break
-
-      gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-      h_frame, w_frame = gray.shape[:2]
-      min_h = int(h_frame * args.min_size_ratio)
-      min_size = (min_h, min_h)
-
-      raw_faces = detect_faces(gray, cascade, scale=args.scale, min_neighbors=args.neighbors, min_size=min_size)
-      filtered = filter_candidates(raw_faces, gray.shape, aspect_min=args.aspect_min, aspect_max=args.aspect_max)
-      validated = eye_stage_validation(gray, filtered, eye_cascade)
-      if not args.no_stabilize:
-        final_faces = stabilize_detections(history, validated)
+      if grabber:
+        frame_proc = grabber.read()
+        if frame_proc is None:
+          time.sleep(0.005)
+          continue
+        source_frame = frame_proc
+        scale_used = 1.0
       else:
-        final_faces = validated
+        ret, frame = cap.read()  # type: ignore
+        if not ret:
+          print("[WARN] Gagal baca frame. Keluar.")
+          break
+        source_frame = frame
+        scale_used = 1.0
+        if args.detect_width and frame.shape[1] > args.detect_width:
+          scale_used = args.detect_width / float(frame.shape[1])
+          source_frame = cv2.resize(frame, (int(frame.shape[1]*scale_used), int(frame.shape[0]*scale_used)))
 
-      draw_face_boxes(frame, final_faces)
+      h_small = source_frame.shape[0]
+      min_size_px = int(h_small * args.min_size_ratio)
+      params = DetectParams(
+        min_size_ratio=args.min_size_ratio,
+        aspect_min=args.aspect_min,
+        aspect_max=args.aspect_max,
+        min_size_pixels=min_size_px,
+      )
+      boxes_small = detector.detect(source_frame, params)
+      raw_count = len(boxes_small)
+      if stabilizer:
+        boxes_small = stabilizer.apply(boxes_small)
 
-      cv2.putText(frame, f"Faces: {len(final_faces)} (raw:{len(raw_faces)})", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
-      cv2.putText(frame, f"scale={args.scale} neigh={args.neighbors}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 255, 200), 1, cv2.LINE_AA)
+      if args.no_thread and scale_used != 1.0:
+        inv = 1.0 / scale_used
+        boxes = [(int(x*inv), int(y*inv), int(w*inv), int(h*inv)) for (x, y, w, h) in boxes_small]
+        draw_target = frame  # original
+      else:
+        boxes = boxes_small
+        draw_target = source_frame
 
-      cv2.imshow(WINDOW_NAME, frame)
+      method_label = (
+        f"haar s={args.scale} n={args.neighbors}" if args.method == 'haar' else f"dnn thr={args.dnn_threshold:.2f}"
+      )
+      draw_overlay(draw_target, boxes, method_label, raw_count, fps, args.detect_width, not args.no_thread)
+      cv2.imshow(WINDOW_NAME, draw_target)
+
+      # FPS update (half-second window)
+      now = time.time()
+      if now - fps_time >= 0.5:
+        fps = 1.0 / (now - fps_time) if now != fps_time else 0.0
+        fps_time = now
+
       if cv2.waitKey(1) & 0xFF == ord('q'):
         break
   finally:
-    cap.release()
+    if grabber:
+      grabber.stop()
+    if cap:
+      cap.release()
     cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":  # pragma: no cover (manual run)
+if __name__ == "__main__":  # pragma: no cover
   main()
